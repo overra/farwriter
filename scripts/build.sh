@@ -10,7 +10,7 @@ if [[ "$ENABLE_TTS" != 0 && "$ENABLE_TTS" != 1 ]]; then
   exit 1
 fi
 
-for command in git xcodegen xcodebuild swift bun; do
+for command in git xcodegen xcodebuild swift; do
   command -v "$command" >/dev/null || {
     echo "Missing required command: $command" >&2
     echo "Run $SCRIPTS/setup.sh first." >&2
@@ -41,9 +41,9 @@ for path in /opt/homebrew/include/opus/opus.h /opt/homebrew/lib/libopus.a; do
   fi
 done
 
-if [[ ! -d "$ROOT/node_modules/@earendil-works/pi-coding-agent" ]]; then
-  echo "Missing local pi packages. Run $SCRIPTS/setup.sh first." >&2
-  exit 1
+if command -v bun >/dev/null && [[ ! -d "$ROOT/node_modules/@earendil-works/pi-coding-agent" ]]; then
+  echo "Local pi packages are missing. Assistant mode will not build until"
+  echo "you re-run $SCRIPTS/setup.sh with bun installed."
 fi
 
 if [[ ! -d "$FLUID/.git" ]]; then
@@ -126,7 +126,7 @@ fi
 
 cat <<EOF
 
-Siri Remote voice stack built successfully.
+Farwriter built successfully.
 Run:
   $SCRIPTS/run.sh
 EOF

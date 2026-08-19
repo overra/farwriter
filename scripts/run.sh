@@ -22,12 +22,12 @@ TTS_URL="http://127.0.0.1:$TTS_PORT"
 ENABLE_TTS=${IREMOTE_ENABLE_TTS:-0}
 TTS_VOICE=${IREMOTE_TTS_VOICE:-am_michael}
 TTS_COMMAND=${IREMOTE_TTS_COMMAND:-}
-KEY_FILE="$GENERATED/siri-remote-cleaner.key"
-CLEANER_PID_FILE="$GENERATED/siri-remote-cleaner.pid"
-ASSISTANT_PID_FILE="$GENERATED/siri-remote-assistant.pid"
-TTS_PID_FILE="$GENERATED/siri-remote-tts.pid"
-APP_PID_FILE="$GENERATED/siri-remote-app.pid"
-RUNTIME_TMP="$GENERATED/siri-remote-runtime-tmp"
+KEY_FILE="$GENERATED/farwriter-cleaner.key"
+CLEANER_PID_FILE="$GENERATED/farwriter-cleaner.pid"
+ASSISTANT_PID_FILE="$GENERATED/farwriter-assistant.pid"
+TTS_PID_FILE="$GENERATED/farwriter-tts.pid"
+APP_PID_FILE="$GENERATED/farwriter-app.pid"
+RUNTIME_TMP="$GENERATED/farwriter-runtime-tmp"
 PACKETLOGGER_CAPTURE_PATTERN="/Applications/PacketLogger.app/Contents/Resources/packetlogger convert -b -o /tmp/iremote-window-live/remote.pklg"
 CAPTURE_HELPER=/usr/local/bin/iremote-capture-helper
 ROLLING_WORK_DIR=/tmp/iremote-window-live
@@ -71,7 +71,7 @@ stop_stack() {
 
 if [[ ${1:-} == --stop ]]; then
   stop_stack
-  echo "Siri Remote voice stack stopped."
+  echo "Farwriter stopped."
   exit 0
 fi
 
@@ -81,16 +81,24 @@ for path in \
   "$PARAKEET_DIR" \
   "$STREAMING_MODEL_DIR" \
   "$VENV/bin/python" \
-  "$CLEANER_SCRIPT" \
-  "$ASSISTANT_SCRIPT" \
-  "$ASSISTANT_EXTENSION" \
-  "$ROOT/node_modules/@earendil-works/pi-coding-agent"; do
+  "$CLEANER_SCRIPT"; do
   if [[ ! -e "$path" ]]; then
     echo "Missing build artifact: $path" >&2
     echo "Run $SCRIPTS/setup.sh, then $SCRIPTS/build.sh." >&2
     exit 1
   fi
 done
+
+enable_assistant=0
+if command -v pi >/dev/null \
+  && [[ -e "$ASSISTANT_SCRIPT" ]] \
+  && [[ -e "$ASSISTANT_EXTENSION" ]] \
+  && [[ -d "$ROOT/node_modules/@earendil-works/pi-coding-agent" ]]; then
+  enable_assistant=1
+else
+  echo "Assistant is off. Dictation will still run."
+  echo "To enable it, install pi and bun, then re-run setup.sh."
+fi
 
 if [[ "$ENABLE_TTS" != 0 && "$ENABLE_TTS" != 1 ]]; then
   echo "IREMOTE_ENABLE_TTS must be 0 or 1." >&2
@@ -104,12 +112,6 @@ if [[ "$ENABLE_TTS" == 1 ]]; then
       exit 1
     fi
   done
-fi
-
-if ! command -v pi >/dev/null; then
-  echo "pi is not on PATH. Assistant mode needs a configured pi install." >&2
-  echo "Dictation will not start until the assistant worker can launch." >&2
-  exit 1
 fi
 
 if [[ ! -x /Applications/PacketLogger.app/Contents/Resources/packetlogger ]]; then
@@ -134,44 +136,49 @@ mkdir -p "$RUNTIME_TMP"
 chmod 700 "$RUNTIME_TMP"
 export TMPDIR="$RUNTIME_TMP"
 
-# The assistant extension resolves @earendil-works/* from this repo, not from
-# whichever directory pi happens to start in.
-export NODE_PATH="$ROOT/node_modules${NODE_PATH:+:$NODE_PATH}"
+assistant_pid=""
+assistant_endpoint=""
+if [[ "$enable_assistant" == 1 ]]; then
+  # The assistant extension resolves @earendil-works/* from this repo, not from
+  # whichever directory pi happens to start in.
+  export NODE_PATH="$ROOT/node_modules${NODE_PATH:+:$NODE_PATH}"
 
-if [[ -n ${IREMOTE_ASSISTANT_MODEL:-} ]]; then
-  nohup "$VENV/bin/python" "$ASSISTANT_SCRIPT" \
-    --port "$ASSISTANT_PORT" \
-    --key-file "$KEY_FILE" \
-    --extension "$ASSISTANT_EXTENSION" \
-    --model "$IREMOTE_ASSISTANT_MODEL" \
-    >"$GENERATED/siri-remote-assistant.log" 2>&1 &
-else
-  nohup "$VENV/bin/python" "$ASSISTANT_SCRIPT" \
-    --port "$ASSISTANT_PORT" \
-    --key-file "$KEY_FILE" \
-    --extension "$ASSISTANT_EXTENSION" \
-    >"$GENERATED/siri-remote-assistant.log" 2>&1 &
-fi
-assistant_pid=$!
-echo "$assistant_pid" >"$ASSISTANT_PID_FILE"
+  if [[ -n ${IREMOTE_ASSISTANT_MODEL:-} ]]; then
+    nohup "$VENV/bin/python" "$ASSISTANT_SCRIPT" \
+      --port "$ASSISTANT_PORT" \
+      --key-file "$KEY_FILE" \
+      --extension "$ASSISTANT_EXTENSION" \
+      --model "$IREMOTE_ASSISTANT_MODEL" \
+      >"$GENERATED/siri-remote-assistant.log" 2>&1 &
+  else
+    nohup "$VENV/bin/python" "$ASSISTANT_SCRIPT" \
+      --port "$ASSISTANT_PORT" \
+      --key-file "$KEY_FILE" \
+      --extension "$ASSISTANT_EXTENSION" \
+      >"$GENERATED/siri-remote-assistant.log" 2>&1 &
+  fi
+  assistant_pid=$!
+  echo "$assistant_pid" >"$ASSISTANT_PID_FILE"
 
-assistant_ready=false
-for _ in $(seq 1 120); do
-  if curl --fail --silent \
-    --header "Authorization: Bearer $key" \
-    "$ASSISTANT_URL/health" >/dev/null; then
-    assistant_ready=true
-    break
+  assistant_ready=false
+  for _ in $(seq 1 120); do
+    if curl --fail --silent \
+      --header "Authorization: Bearer $key" \
+      "$ASSISTANT_URL/health" >/dev/null; then
+      assistant_ready=true
+      break
+    fi
+    if ! kill -0 "$assistant_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if [[ $assistant_ready != true ]]; then
+    stop_pid_file "$ASSISTANT_PID_FILE"
+    echo "Voice assistant failed to start; see $GENERATED/siri-remote-assistant.log" >&2
+    exit 1
   fi
-  if ! kill -0 "$assistant_pid" 2>/dev/null; then
-    break
-  fi
-  sleep 0.25
-done
-if [[ $assistant_ready != true ]]; then
-  stop_pid_file "$ASSISTANT_PID_FILE"
-  echo "Voice assistant failed to start; see $GENERATED/siri-remote-assistant.log" >&2
-  exit 1
+  assistant_endpoint="$ASSISTANT_URL/assist"
 fi
 
 export HF_HOME="$HF_HOME_DIR"
@@ -244,7 +251,7 @@ IREMOTE_PARAKEET_CLI="$FLUID_CLI" \
   IREMOTE_STREAMING_MODEL_DIR="$STREAMING_MODEL_DIR" \
   IREMOTE_CLEANER_URL="$CLEANER_URL/clean" \
   IREMOTE_CLEANER_KEY_FILE="$KEY_FILE" \
-  IREMOTE_ASSISTANT_URL="$ASSISTANT_URL/assist" \
+  IREMOTE_ASSISTANT_URL="$assistant_endpoint" \
   IREMOTE_TTS_URL="$tts_endpoint" \
   IREMOTE_TTS_COMMAND="$TTS_COMMAND" \
   nohup "$APP_BINARY" >"$GENERATED/iremote-app.stdout.log" 2>&1 &
@@ -289,7 +296,11 @@ nohup bash -c "
 " _ "$app_pid" "$cleaner_pid" "$assistant_pid" "$APP_PID_FILE" "$CLEANER_PID_FILE" "$ASSISTANT_PID_FILE" "$PACKETLOGGER_CAPTURE_PATTERN" "$CAPTURE_HELPER" "$ROLLING_WORK_DIR" "$tts_pid" "$TTS_PID_FILE" \
   >/dev/null 2>&1 &
 
-echo "Siri Remote voice stack is running (app PID $app_pid)."
-echo "Hold Siri, speak, then release."
-echo "Double-tap Siri for Enter. Tap Back to delete; hold Back to keep deleting."
-echo "Tap, then hold Siri within 1.4 seconds for assistant."
+echo "Farwriter is running (app PID $app_pid)."
+echo "Hold the microphone button, speak, then release."
+echo "Double-tap that button for Enter. Tap Back to delete; hold Back to keep deleting."
+if [[ "$enable_assistant" == 1 ]]; then
+  echo "Tap, then hold the microphone button within 1.4 seconds for assistant."
+else
+  echo "Assistant is off."
+fi

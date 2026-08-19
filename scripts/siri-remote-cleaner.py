@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback-only, in-memory transcript cleanup for Siri Remote dictation."""
+"""Loopback-only, in-memory transcript cleanup for Farwriter dictation."""
 
 from __future__ import annotations
 

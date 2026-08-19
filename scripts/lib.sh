@@ -1,4 +1,4 @@
-# Shared paths for the Siri Remote voice stack.
+# Shared paths for Farwriter.
 # shellcheck shell=bash
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -7,8 +7,8 @@ PATCHES="$ROOT/patches"
 GENERATED="$ROOT/generated"
 IREMOTE="$GENERATED/iRemote-upstream"
 FLUID="$GENERATED/FluidAudio-upstream"
-VENV="$GENERATED/siri-remote-voice-venv"
-KOKORO_VENV="$GENERATED/siri-remote-kokoro-venv"
+VENV="$GENERATED/farwriter-venv"
+KOKORO_VENV="$GENERATED/farwriter-kokoro-venv"
 HF_HOME_DIR="$GENERATED/huggingface"
 PATCH="$PATCHES/iremote-silver-remotes.patch"
 

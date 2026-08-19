@@ -1,40 +1,61 @@
-# Siri Remote voice
+# Farwriter
 
-Local voice input for the aluminum Apple Siri Remote on macOS. It uses the
-remote's microphone, not the Mac's. Dictation stays on the machine. The
-optional assistant can open a search, launch an installed app, or play
-YouTube / YouTube Music.
+Hold a clicker, speak, and the words land in the focused app.
 
-This was lifted out of [clanklin.com](https://github.com/overra/clanklin.com)
-so another household Mac can clone it without taking the whole house.
+Farwriter is local voice input for the silver Apple TV remotes (A2540
+Lightning and A2854 USB-C) on Apple Silicon Macs. It uses the remote's
+microphone, not the Mac's. Ordinary dictation never leaves the machine.
+
+This is an independent project and is not affiliated with, endorsed by,
+or associated with Apple Inc.
 
 ## What you get
 
-- Hold **Siri** to dictate. Live captions appear; the focused app only
-  receives the cleaned final text.
-- Double-tap **Siri** to send Return.
-- Tap **Back** to delete one character; hold Back and it repeats like a
+- Hold the microphone button to dictate. Live captions appear; the
+  focused app only receives the cleaned final text.
+- Double-tap that button to send Return.
+- Tap Back to delete one character; hold Back and it repeats like a
   phone keyboard.
-- Tap Siri, then hold within 1.4 seconds for a one-shot orange assistant.
+- Optional: tap, then hold within 1.4 seconds for a one-shot assistant
+  that can open a search, launch an installed app, or play YouTube /
+  YouTube Music.
 
 Play/Pause, volume, and mute stay with the system.
 
+## Why this is a workshop, not a welcome mat
+
+Apple's public HID APIs expose the remote's buttons. They do not expose
+the microphone. The system Bluetooth stack consumes that audio before
+userspace can hear it.
+
+Farwriter does not guess packets. It already knows the Opus frames and
+the ATT handles. What it cannot do, without help, is *see* them.
+
+The free latch is Apple's own diagnostic tap: PacketLogger, from
+Additional Tools for Xcode, plus the Bluetooth Logging for macOS
+profile. This repository does not bundle, download, or redistribute
+either one. You fetch them from Apple, then Farwriter tails the capture
+PacketLogger writes.
+
+That is a diagnostic key, not a supported input API. Future macOS
+releases can close it. Engineers should treat this as a locksmith's
+latch, not a doorbell.
+
 ## On another Mac
 
-You need Apple Silicon, macOS 14 or newer, and a silver Remote (A2540
-Lightning or A2854 USB-C).
+You need Apple Silicon, macOS 14 or newer, and a paired silver remote.
 
 ```bash
-git clone git@github.com:overra/siri-remote-voice.git
-cd siri-remote-voice
+git clone git@github.com:overra/farwriter.git
+cd farwriter
 ./scripts/setup.sh
 ./scripts/build.sh
 ./scripts/run.sh
 ```
 
 `setup.sh` installs Homebrew packages (`opus`, `xcodegen`, `python@3.12`,
-`bun` if missing) and the local pi TypeScript packages. It will not
-download Apple's PacketLogger for you.
+`bun` if missing) and the local TypeScript packages used by the optional
+assistant. It will not download Apple's tools.
 
 Apple steps, once per machine:
 
@@ -42,8 +63,10 @@ Apple steps, once per machine:
    [developer.apple.com](https://developer.apple.com/download/all/?q=Additional%20Tools).
 2. Put `PacketLogger.app` in `/Applications`.
 3. Install the **Bluetooth Logging for macOS** profile
-   (`com.apple.bluetooth.1`).
-4. Pair the Remote.
+   (`com.apple.bluetooth.1`) from those same additional tools. Sign in
+   with an Apple ID; approve the profile in System Settings. Do not
+   redistribute the profile.
+4. Pair the remote.
 
 The first run of the app asks for administrator approval to install a
 narrow PacketLogger helper. That is expected.
@@ -66,9 +89,12 @@ That costs about 2 GiB of memory for little payoff beside the captions.
 
 ## Assistant
 
-Pi must already be installed and configured. The runner starts a
-tool-limited session with no shell, filesystem, browser, or AppleScript
-tool. It can only:
+The assistant is optional. Dictation works without it.
+
+To enable the orange one-shot mode, install and configure
+[`pi`](https://github.com/earendil-works/pi) so the `pi` binary is on
+`PATH`. The runner then starts a tool-limited session with no shell,
+filesystem, browser, or AppleScript tool. It can only:
 
 - open an encoded Google or Perplexity search (Google unless you name
   Perplexity)
@@ -118,3 +144,14 @@ only to `127.0.0.1` and share a mode-`0600` bearer key under `generated/`.
 Utterance audio is deleted after editing. PacketLogger's rolling capture
 is removed when the listener stops. The Apple Bluetooth logging profile
 stays installed until you remove it in System Settings.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+Farwriter is not affiliated with Apple. PacketLogger and the Bluetooth
+Logging profile are Apple's, fetched by you, never shipped here.
+
+This started as a household experiment in
+[clanklin](https://github.com/overra/clanklin.com) and now lives on its
+own so other engineers can pick it up.

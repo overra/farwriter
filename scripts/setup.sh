@@ -45,21 +45,20 @@ if [[ ! -f /opt/homebrew/lib/libopus.a ]]; then
 fi
 
 if ! command -v bun >/dev/null; then
-  echo "Installing bun via Homebrew..."
-  brew install oven-sh/bun/bun
+  echo "bun is not on PATH. Dictation will still build; assistant mode will not."
+  echo "Install bun (brew install oven-sh/bun/bun) if you want the optional assistant."
+else
+  (
+    cd "$ROOT"
+    bun install --frozen-lockfile 2>/dev/null || bun install
+  )
 fi
-need bun "Install bun: brew install oven-sh/bun/bun"
 
 if ! command -v pi >/dev/null; then
   echo "pi is not on PATH. Dictation will still build; assistant mode will not."
   echo "Install @earendil-works/pi-coding-agent, put pi on PATH, and configure"
   echo "a model provider before using the orange assistant."
 fi
-
-(
-  cd "$ROOT"
-  bun install --frozen-lockfile 2>/dev/null || bun install
-)
 
 cat <<EOF
 
@@ -72,15 +71,15 @@ Apple still has to be installed by hand, once per machine:
    and put PacketLogger.app in /Applications.
 2. Install Apple's Bluetooth Logging for macOS profile
    (com.apple.bluetooth.1) from those same additional tools.
-3. Pair a silver Siri Remote A2540 or A2854.
+3. Pair a silver Apple TV remote, A2540 or A2854.
 
 Then:
 
   $SCRIPTS/build.sh
   $SCRIPTS/run.sh
 
-The first launch of iRemote will ask for administrator approval to
-install its PacketLogger helper. That is expected.
+The first launch will ask for administrator approval to install a
+narrow PacketLogger helper. That is expected.
 
 First build downloads a few gigabytes of models. Later builds reuse
 generated/.

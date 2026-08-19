@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticated loopback Kokoro TTS worker for the Siri Remote assistant."""
+"""Authenticated loopback Kokoro TTS worker for the Farwriter assistant."""
 
 from __future__ import annotations
 

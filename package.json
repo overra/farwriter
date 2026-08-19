@@ -1,8 +1,8 @@
 {
-  "name": "siri-remote-voice",
+  "name": "farwriter",
   "private": true,
   "type": "module",
-  "description": "Local Siri Remote voice input and a narrow one-shot assistant for macOS.",
+  "description": "Local voice input from a silver Apple TV remote on macOS.",
   "dependencies": {
     "@earendil-works/pi-ai": "0.84.2",
     "@earendil-works/pi-coding-agent": "0.84.2",
