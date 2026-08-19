@@ -1,0 +1,11 @@
+{
+  "name": "siri-remote-voice",
+  "private": true,
+  "type": "module",
+  "description": "Local Siri Remote voice input and a narrow one-shot assistant for macOS.",
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "typebox": "1.3.7"
+  }
+}

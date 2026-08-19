@@ -1,0 +1,1727 @@
+diff --git a/iRemote/App/AppDelegate.swift b/iRemote/App/AppDelegate.swift
+index 4f5dfb8..04dfdb2 100644
+--- a/iRemote/App/AppDelegate.swift
++++ b/iRemote/App/AppDelegate.swift
+@@ -11,7 +11,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+     private var calibrationController: CalibrationWindowController?
+     private var modelManagerController: ModelManagerWindowController?
+     private let profileMonitor = ProfileMonitor()
++    private let dictationOverlay = DictationOverlayController()
++    private let assistant = RemoteAssistantClient()
++    private var siriPressStartedAt: Date?
++    private var assistantArmedUntil: Date?
++    private var pendingArmedPress = false
++    private var armedHoldConfirmTask: Task<Void, Never>?
++    private var assistantCaptureActive = false
++    private var assistantResultExpected = false
++    private var assistantOverlayToken = UUID()
++    private let assistantArmTapMaximum: TimeInterval = 0.32
++    private let assistantArmWindow: TimeInterval = 1.4
+     private var lastUtteranceText: String = "—"
++    private var backspaceRepeatTask: Task<Void, Never>?
++    private var backspaceRepeatCount = 0
++    private let backspaceHoldDelay: TimeInterval = 0.45
++    private let backspaceInitialInterval: TimeInterval = 0.12
++    private let backspaceFastestInterval: TimeInterval = 0.035
+     private var totalUtterances: Int = 0
+     private var injectResults = true
+     private var listenerRunning = false
+@@ -129,7 +145,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+ 
+     private func stopRemoteListener() {
+         listenerRunning = false
++        endBackspaceRepeat()
+         remote?.stopContinuousListening()
++        hidManager?.stop()
++        hidManager = nil
+         menuBar?.setMode("Off")
+         menuBar?.setStatus(.stopped)
+         menuBar?.appendLog("Remote mic listener paused")
+@@ -173,31 +192,201 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+     private func handleRemoteButton(_ text: String) {
+         menuBar?.appendLog("Remote button: \(text)")
+ 
++        if text.hasPrefix("Back ") {
++            if text.contains("↓") {
++                beginBackspaceRepeat()
++            } else if text.contains("↑") {
++                endBackspaceRepeat()
++            }
++            return
++        }
++
+         // The Siri/mic button comes through the macOS HID stack on this
+         // remote — the MENU button and touchpad do NOT (see
+         // handleRemoteBLEButton / handleTouchpadSample for those paths).
+         guard text.hasPrefix("Search/Siri") else { return }
+ 
++        let now = Date()
+         if text.contains("↓") {
+-            let hasFrames = remote?.setRemoteMicButtonDown(true) ?? false
+-            if listenerRunning || hasFrames {
+-                menuBar?.setStatus(.recording)
+-            }
++            handleSiriPressDown(at: now)
+         } else if text.contains("↑") {
+-            let hasFrames = remote?.setRemoteMicButtonDown(false) ?? false
+-            if listenerRunning && !hasFrames {
+-                menuBar?.setStatus(.listening)
++            handleSiriPressUp(at: now)
++        }
++    }
++
++    private func handleSiriPressDown(at now: Date) {
++        assistantOverlayToken = UUID()
++        siriPressStartedAt = now
++        cancelArmedHoldConfirm()
++
++        let armed = assistantArmedUntil.map { now <= $0 } ?? false
++        assistantArmedUntil = nil
++        if armed {
++            // A second press in the arm window is either a double-tap
++            // (Enter) or a hold (assistant). Wait for the tap threshold
++            // before starting a command recording.
++            pendingArmedPress = true
++            assistantCaptureActive = false
++            assistantResultExpected = false
++            remote?.cancelCurrentUtterance()
++            dictationOverlay.show("Armed — release for Enter, or keep holding", style: .assistant)
++            menuBar?.appendLog("Armed Siri press: waiting for tap or hold")
++            armedHoldConfirmTask = Task { [weak self] in
++                let seconds = self?.assistantArmTapMaximum ?? 0.32
++                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
++                guard let self, !Task.isCancelled else { return }
++                self.confirmArmedHold()
++            }
++            return
++        }
++
++        pendingArmedPress = false
++        assistantCaptureActive = false
++        assistantResultExpected = false
++        let hasFrames = remote?.setRemoteMicButtonDown(true) ?? false
++        if listenerRunning || hasFrames {
++            menuBar?.setStatus(.recording)
++        }
++    }
++
++    private func handleSiriPressUp(at now: Date) {
++        let duration = siriPressStartedAt.map { now.timeIntervalSince($0) } ?? .infinity
++        siriPressStartedAt = nil
++        cancelArmedHoldConfirm()
++
++        if pendingArmedPress {
++            // Released before the 320 ms hold timer. That is the second tap.
++            pendingArmedPress = false
++            remote?.cancelCurrentUtterance()
++            resetAssistantGestureState()
++            postReturnKey()
++            return
++        }
++
++        if !assistantCaptureActive && duration <= assistantArmTapMaximum {
++            remote?.cancelCurrentUtterance()
++            assistantResultExpected = false
++            let deadline = now.addingTimeInterval(assistantArmWindow)
++            assistantArmedUntil = deadline
++            assistantOverlayToken = UUID()
++            dictationOverlay.show("Armed — double-tap Enter, or hold to ask", style: .assistant)
++            menuBar?.setStatus(.listening)
++            menuBar?.appendLog("Siri armed: double-tap Enter, or hold for assistant")
++            Task { [weak self] in
++                try? await Task.sleep(nanoseconds: 1_400_000_000)
++                guard let self, self.assistantArmedUntil == deadline else { return }
++                self.assistantArmedUntil = nil
++                self.dictationOverlay.hide()
++                self.menuBar?.appendLog("Siri arm expired")
++            }
++            return
++        }
++
++        let hasFrames = remote?.setRemoteMicButtonDown(false) ?? false
++        if listenerRunning && !hasFrames {
++            menuBar?.setStatus(.listening)
++        }
++    }
++
++    private func confirmArmedHold() {
++        guard !assistantCaptureActive, siriPressStartedAt != nil else { return }
++        pendingArmedPress = false
++        cancelArmedHoldConfirm()
++        assistantCaptureActive = true
++        assistantResultExpected = true
++        assistantOverlayToken = UUID()
++        let hasFrames = remote?.setRemoteMicButtonDown(true) ?? false
++        dictationOverlay.show("Assistant listening…", style: .assistant)
++        menuBar?.appendLog("Assistant mode: recording command")
++        if listenerRunning || hasFrames {
++            menuBar?.setStatus(.recording)
++        }
++    }
++
++    private func cancelArmedHoldConfirm() {
++        armedHoldConfirmTask?.cancel()
++        armedHoldConfirmTask = nil
++    }
++
++    private func resetAssistantGestureState() {
++        pendingArmedPress = false
++        assistantCaptureActive = false
++        assistantResultExpected = false
++        assistantArmedUntil = nil
++        cancelArmedHoldConfirm()
++    }
++
++    private func beginBackspaceRepeat() {
++        guard backspaceRepeatTask == nil else { return }
++        backspaceRepeatCount = 0
++        postDeleteKey(log: true)
++        backspaceRepeatTask = Task { [weak self] in
++            let delay = self?.backspaceHoldDelay ?? 0.45
++            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
++            while let self, !Task.isCancelled {
++                self.backspaceRepeatCount += 1
++                self.postDeleteKey(log: self.backspaceRepeatCount == 1)
++                let interval = self.backspaceRepeatInterval(after: self.backspaceRepeatCount)
++                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+             }
+         }
+     }
+ 
++    private func endBackspaceRepeat() {
++        backspaceRepeatTask?.cancel()
++        backspaceRepeatTask = nil
++        backspaceRepeatCount = 0
++    }
++
++    private func backspaceRepeatInterval(after count: Int) -> TimeInterval {
++        // iPhone-like: a pause, then letters, then a quicker run.
++        if count < 8 { return backspaceInitialInterval }
++        let ramp = Double(count - 8) * 0.008
++        return max(backspaceFastestInterval, backspaceInitialInterval - ramp)
++    }
++
++    private func postDeleteKey(log: Bool = false) {
++        let deleteKey: CGKeyCode = 51
++        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: deleteKey, keyDown: true),
++              let up = CGEvent(keyboardEventSource: nil, virtualKey: deleteKey, keyDown: false) else {
++            menuBar?.appendLog("Back → Delete failed")
++            return
++        }
++        down.post(tap: .cghidEventTap)
++        up.post(tap: .cghidEventTap)
++        if log {
++            menuBar?.appendLog(backspaceRepeatCount == 0 ? "Back → Delete" : "Back hold → Delete")
++        }
++    }
++
++    private func postReturnKey() {
++        let returnKey: CGKeyCode = 36
++        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: returnKey, keyDown: true),
++              let up = CGEvent(keyboardEventSource: nil, virtualKey: returnKey, keyDown: false) else {
++            dictationOverlay.hide()
++            menuBar?.appendLog("Siri double-tap → Return failed")
++            return
++        }
++        down.post(tap: .cghidEventTap)
++        up.post(tap: .cghidEventTap)
++        dictationOverlay.show("Return")
++        menuBar?.appendLog("Siri double-tap → Return")
++        menuBar?.setStatus(listenerRunning ? .listening : .standby)
++        let token = UUID()
++        assistantOverlayToken = token
++        Task { [weak self] in
++            try? await Task.sleep(nanoseconds: 600_000_000)
++            guard let self, self.assistantOverlayToken == token else { return }
++            self.dictationOverlay.hide()
++        }
++    }
++
+     /// Button bitmap decoded from BLE handle 0x0023 (2-byte reports).
+     /// Byte 1 of the report is a bitmap of which buttons are *currently*
+-    /// held down: 0x20 is the MENU bit; 0x00 means "no buttons". Releases
+-    /// of *any* button produce 0x00, so toggling on 0x00 alone would
+-    /// (incorrectly) trigger on every button release. We track the last
+-    /// non-zero press and act on the 0x00 release only if the MENU bit
+-    /// was part of that press.
++    /// held down: 0x20 is the Back/MENU bit; 0x00 means "no buttons".
++    /// Releases of *any* button produce 0x00, so acting on 0x00 alone
++    /// would fire on every button release. We track the last non-zero
++    /// press and treat only a 0x20 release as Back coming up.
+     private var lastBLEButtonPress: UInt8 = 0
+ 
+     private func handleRemoteBLEButton(code: UInt8) {
+@@ -210,8 +399,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+             // to alias 0x20. Touchpad clicks come through the touchpad
+             // sample stream (byte 1 = 0x80), not the button stream.
+             if released == 0x20 {
+-                menuBar?.toggleMenu()
++                endBackspaceRepeat()
+             }
++        } else if code == 0x20 {
++            lastBLEButtonPress = code
++            beginBackspaceRepeat()
+         } else {
+             lastBLEButtonPress = code
+             menuBar?.appendLog(String(format: "Remote BLE button pressed: 0x%02X", code))
+@@ -356,20 +548,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         case .recording:
+             menuBar?.setStatus(.recording)
+             menuBar?.appendLog("Remote mic started")
++            if assistantCaptureActive || assistantResultExpected {
++                dictationOverlay.show("Assistant listening…", style: .assistant)
++            } else {
++                dictationOverlay.show("Listening…")
++            }
++
++        case .partialTranscript(let transcript):
++            dictationOverlay.show(
++                transcript,
++                style: assistantCaptureActive || assistantResultExpected ? .assistant : .dictation
++            )
++
++        case .streamingReady:
++            menuBar?.appendLog("Live captions ready (160 ms Parakeet)")
++
++        case .streamingUnavailable(let message):
++            menuBar?.appendLog("Live captions unavailable: \(message)")
++            if let data = "Live captions unavailable: \(message)\n".data(using: .utf8) {
++                FileHandle.standardError.write(data)
++            }
+ 
+         case .transcribing:
+             menuBar?.setStatus(.transcribing)
+             menuBar?.appendLog("Remote mic stopped; transcribing")
++            if assistantResultExpected {
++                dictationOverlay.show("Understanding command…", style: .assistant)
++            }
+ 
+         case .result(let result):
+             handleRemoteResult(result)
+ 
+         case .failed(let message):
++            dictationOverlay.hide()
++            resetAssistantGestureState()
++            endBackspaceRepeat()
+             listenerRunning = false
+             menuBar?.setStatus(.problem)
+             menuBar?.appendLog("Remote listener failed: \(message)")
+ 
+         case .stopped:
++            dictationOverlay.hide()
++            endBackspaceRepeat()
+             listenerRunning = false
+             menuBar?.setMode("Off")
+             menuBar?.setStatus(.stopped)
+@@ -384,9 +604,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+     }
+ 
+     private func handleRemoteResult(_ result: RemoteDictationResult) {
++        dictationOverlay.hide()
+         totalUtterances += 1
+         lastUtteranceText = result.transcript
+         menuBar?.appendLog("Remote → \"\(result.transcript)\"")
++        if let editMode = result.editMode {
++            menuBar?.appendLog("Gemma editor: \(editMode)")
++        }
+         if let wavPath = result.wavPath {
+             menuBar?.appendLog("Raw WAV: \(wavPath)")
+         }
+@@ -396,6 +620,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         if result.opusFrameCount > 0 {
+             menuBar?.appendLog("Opus frames: \(result.opusFrameCount)")
+         }
++        if assistantResultExpected {
++            assistantResultExpected = false
++            assistantCaptureActive = false
++            handleAssistantTranscript(result.transcript)
++            return
++        }
+         if injectResults {
+             if injector?.hasAccessibility() == true {
+                 if injector?.inject(result.transcript + " ") == true {
+@@ -411,6 +641,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         menuBar?.setStatus(listenerRunning ? .listening : .standby)
+     }
+ 
++    private func handleAssistantTranscript(_ transcript: String) {
++        guard assistant.isConfigured else {
++            dictationOverlay.show("Assistant bridge is unavailable", style: .assistant)
++            menuBar?.appendLog("Assistant unavailable: bridge is not configured")
++            menuBar?.setStatus(listenerRunning ? .listening : .standby)
++            return
++        }
++
++        let token = UUID()
++        assistantOverlayToken = token
++        dictationOverlay.show("Working…", style: .assistant)
++        menuBar?.appendLog("Assistant request → \"\(transcript)\"")
++        Task { [weak self] in
++            guard let self else { return }
++            do {
++                let answer = try await self.assistant.assist(transcript)
++                guard self.assistantOverlayToken == token else { return }
++                self.dictationOverlay.show(answer, style: .assistant)
++                self.menuBar?.appendLog("Assistant ← \"\(answer)\"")
++                self.assistant.speak(answer)
++                self.menuBar?.setStatus(self.listenerRunning ? .listening : .standby)
++                try? await Task.sleep(nanoseconds: 6_000_000_000)
++                if self.assistantOverlayToken == token {
++                    self.dictationOverlay.hide()
++                }
++            } catch {
++                guard self.assistantOverlayToken == token else { return }
++                let message = "Assistant failed: \(error.localizedDescription)"
++                self.dictationOverlay.show(message, style: .assistant)
++                self.menuBar?.appendLog(message)
++                self.menuBar?.setStatus(.problem)
++            }
++        }
++    }
++
+     private func toggleInjection() {
+         if !injectResults, injector?.hasAccessibility() != true {
+             injector?.requestAccessibility()
+diff --git a/iRemote/App/DictationOverlayController.swift b/iRemote/App/DictationOverlayController.swift
+new file mode 100644
+index 0000000..b030556
+--- /dev/null
++++ b/iRemote/App/DictationOverlayController.swift
+@@ -0,0 +1,97 @@
++import AppKit
++
++/// Click-through ghost text for unstable streaming ASR hypotheses.
++/// Only the final transcript is ever pasted into the focused application.
++@MainActor
++final class DictationOverlayController {
++    enum Style {
++        case dictation
++        case assistant
++    }
++
++    private let panel: NSPanel
++    private let textField: NSTextField
++    private var lastText = ""
++
++    init() {
++        panel = NSPanel(
++            contentRect: NSRect(x: 0, y: 0, width: 720, height: 124),
++            styleMask: [.borderless, .nonactivatingPanel],
++            backing: .buffered,
++            defer: true
++        )
++        panel.level = .floating
++        panel.isOpaque = false
++        panel.backgroundColor = .clear
++        panel.hasShadow = true
++        panel.ignoresMouseEvents = true
++        panel.hidesOnDeactivate = false
++        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
++
++        let background = NSVisualEffectView(frame: panel.contentView?.bounds ?? .zero)
++        background.material = .hudWindow
++        background.blendingMode = .behindWindow
++        background.state = .active
++        background.wantsLayer = true
++        background.layer?.cornerRadius = 16
++        background.layer?.masksToBounds = true
++        background.translatesAutoresizingMaskIntoConstraints = false
++
++        textField = NSTextField(wrappingLabelWithString: "")
++        textField.font = .systemFont(ofSize: 21, weight: .medium)
++        textField.textColor = .labelColor
++        textField.alignment = .center
++        textField.maximumNumberOfLines = 4
++        textField.lineBreakMode = .byWordWrapping
++        textField.translatesAutoresizingMaskIntoConstraints = false
++
++        guard let contentView = panel.contentView else { return }
++        contentView.addSubview(background)
++        background.addSubview(textField)
++        NSLayoutConstraint.activate([
++            background.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
++            background.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
++            background.topAnchor.constraint(equalTo: contentView.topAnchor),
++            background.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
++            textField.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 24),
++            textField.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -24),
++            textField.topAnchor.constraint(equalTo: background.topAnchor, constant: 18),
++            textField.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -18),
++        ])
++    }
++
++    func show(_ text: String, style: Style = .dictation) {
++        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !normalized.isEmpty else { return }
++        let styleChanged = textField.textColor != color(for: style)
++        guard normalized != lastText || styleChanged else { return }
++        lastText = normalized
++        textField.stringValue = normalized
++        textField.textColor = color(for: style)
++
++        let screen = NSScreen.main ?? NSScreen.screens.first
++        if let visible = screen?.visibleFrame {
++            let origin = NSPoint(
++                x: visible.midX - panel.frame.width / 2,
++                y: visible.minY + 76
++            )
++            panel.setFrameOrigin(origin)
++        }
++        panel.orderFrontRegardless()
++    }
++
++    func hide() {
++        lastText = ""
++        textField.stringValue = ""
++        panel.orderOut(nil)
++    }
++
++    private func color(for style: Style) -> NSColor {
++        switch style {
++        case .dictation:
++            return .labelColor
++        case .assistant:
++            return .systemOrange
++        }
++    }
++}
+diff --git a/iRemote/ButtonInput/ButtonReportParser.swift b/iRemote/ButtonInput/ButtonReportParser.swift
+index 93e8a09..715c661 100644
+--- a/iRemote/ButtonInput/ButtonReportParser.swift
++++ b/iRemote/ButtonInput/ButtonReportParser.swift
+@@ -17,14 +17,22 @@ enum ButtonReportParser {
+         case 0x09: // Button
+             return "Btn \(usage) \(edge)"
+ 
+-        case 0x01: // Generic Desktop (X/Y axes — touchpad)
+-            // Stay quiet on continuous axis spam; surface only edge-ish movements.
+-            // Phase 1 doesn't need touchpad gestures.
+-            return nil
++        case 0x01: // Generic Desktop
++            // X/Y axes stay quiet here; HIDManager surfaces them separately.
++            // On aluminum remotes the Back/Menu chevron arrives as 0x86.
++            switch usage {
++            case 0x40, 0x86:
++                return "Back \(edge)"
++            default:
++                return nil
++            }
+ 
+         case 0x07: // Keyboard
+             return "Key 0x\(String(usage, radix: 16)) \(edge)"
+ 
++        case 0xFF00: // Apple vendor page used by aluminum remotes
++            return "Search/Siri \(edge)"
++
+         default:
+             // Unknown — surface for diagnosis. Drop touchpad-axis spam by
+             // ignoring values inside ±1 on probable analog ranges.
+@@ -37,14 +45,18 @@ enum ButtonReportParser {
+         // Standard HID Consumer Page usages most likely to appear from Siri Remote.
+         // Some Apple-private mappings show up here too; unknowns get hex.
+         switch usage {
++        case 0x0004: return "Search/Siri"
++        case 0x0030: return "Power"
+         case 0x0040: return "Menu"
+         case 0x00B0: return "Play"
+         case 0x00B1: return "Pause"
+         case 0x00CD: return "Play/Pause"
++        case 0x00E2: return "Mute"
+         case 0x00E9: return "Volume +"
+         case 0x00EA: return "Volume −"
+         case 0x0221: return "Search/Siri"
+         case 0x0223: return "Home"
++        case 0x0224: return "Back"
+         case 0x029D: return "AC AppCntl Cfg"
+         default:     return String(format: "Cons 0x%04X", usage)
+         }
+diff --git a/iRemote/ButtonInput/HIDManager.swift b/iRemote/ButtonInput/HIDManager.swift
+index 6163dd3..5d291ec 100644
+--- a/iRemote/ButtonInput/HIDManager.swift
++++ b/iRemote/ButtonInput/HIDManager.swift
+@@ -74,10 +74,17 @@ final class HIDManager {
+     }
+ 
+     func start() throws {
+-        // Match Apple vendor; we filter further inside the matched callback so we
+-        // also notice unexpected Apple devices instead of silently missing them.
+-        let matching: [String: Any] = [kIOHIDVendorIDKey: 0x05AC]
+-        IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
++        // Match only known Siri Remote products. A vendor-wide match would
++        // enumerate and log unrelated Apple peripherals.
++        let matching: [[String: Any]] = [
++            [kIOHIDVendorIDKey: 0x05AC, kIOHIDProductIDKey: 0x0265],
++            [kIOHIDVendorIDKey: 0x05AC, kIOHIDProductIDKey: 0x0266],
++            [kIOHIDVendorIDKey: 0x05AC, kIOHIDProductIDKey: 0x0267],
++            [kIOHIDVendorIDKey: 0x05AC, kIOHIDProductIDKey: 0x026D],
++            [kIOHIDVendorIDKey: 0x004C, kIOHIDProductIDKey: 0x0314],
++            [kIOHIDVendorIDKey: 0x004C, kIOHIDProductIDKey: 0x0315]
++        ]
++        IOHIDManagerSetDeviceMatchingMultiple(manager, matching as CFArray)
+ 
+         let ctx = Unmanaged.passUnretained(self).toOpaque()
+ 
+@@ -99,23 +106,27 @@ final class HIDManager {
+         }
+     }
+ 
++    func stop() {
++        perDevice.removeAll()
++        IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
++        IOHIDManagerUnscheduleFromRunLoop(
++            manager,
++            CFRunLoopGetMain(),
++            CFRunLoopMode.defaultMode.rawValue
++        )
++    }
++
+     // MARK: - Match / Remove
+ 
+     private func handleMatched(_ device: IOHIDDevice) {
+-        let name = stringProp(device, kIOHIDProductKey) ?? "(unknown)"
+         let pid = intProp(device, kIOHIDProductIDKey) ?? 0
+-        let vid = intProp(device, kIOHIDVendorIDKey) ?? 0
+-
+-        guard isLikelySiriRemote(name: name, pid: pid) else {
+-            // Helpful for diagnosing matching issues, but quiet on the menu.
+-            NSLog("HIDManager ignoring non-remote: name=%@ vid=0x%04x pid=0x%04x", name, vid, pid)
+-            return
+-        }
++        guard isLikelySiriRemote(pid: pid) else { return }
+ 
+-        onEvent(HIDEvent(kind: .connected, text: "\(name) (PID=\(hex4(pid)))"))
++        let key = DeviceKey(device)
++        onEvent(HIDEvent(kind: .connected, text: "\(safeRemoteName(pid: pid)) (PID=\(hex4(pid)))"))
+ 
+         let entry = PerDevice(device: device, bufferSize: 512)
+-        perDevice[DeviceKey(device)] = entry
++        perDevice[key] = entry
+ 
+         // Parsed HID values (Consumer-page buttons, generic-desktop axes).
+         IOHIDDeviceRegisterInputValueCallback(device, { ctx, _, _, value in
+@@ -138,9 +149,10 @@ final class HIDManager {
+     }
+ 
+     private func handleRemoved(_ device: IOHIDDevice) {
+-        let name = stringProp(device, kIOHIDProductKey) ?? "(unknown)"
+-        perDevice.removeValue(forKey: DeviceKey(device))
+-        onEvent(HIDEvent(kind: .disconnected, text: name))
++        let pid = intProp(device, kIOHIDProductIDKey) ?? 0
++        let key = DeviceKey(device)
++        perDevice.removeValue(forKey: key)
++        onEvent(HIDEvent(kind: .disconnected, text: safeRemoteName(pid: pid)))
+     }
+ 
+     // MARK: - Events
+@@ -191,19 +203,23 @@ final class HIDManager {
+ 
+     // MARK: - Helpers
+ 
+-    private func isLikelySiriRemote(name: String, pid: Int) -> Bool {
++    private func isLikelySiriRemote(pid: Int) -> Bool {
+         // Known Siri Remote PIDs:
+         //   0x0265 — 1st gen (Apple TV 4G, 2015) — touchpad + glass face
+         //   0x0266 — variant
+         //   0x0267 — 2nd gen (2021)
+         //   0x026D — A1962 / 1st-gen 2016 refresh observed on this project
+-        if [0x0265, 0x0266, 0x0267, 0x026D].contains(pid) { return true }
+-        let lower = name.lowercased()
+-        return lower.contains("siri remote") || lower.contains("apple tv remote")
++        //   0x0314 — A2540 / 2nd-gen aluminum Lightning remote
++        //   0x0315 — A2854 / 3rd-gen aluminum USB-C remote
++        [0x0265, 0x0266, 0x0267, 0x026D, 0x0314, 0x0315].contains(pid)
+     }
+ 
+-    private func stringProp(_ device: IOHIDDevice, _ key: String) -> String? {
+-        IOHIDDeviceGetProperty(device, key as CFString) as? String
++    private func safeRemoteName(pid: Int) -> String {
++        switch pid {
++        case 0x0314: return "Siri Remote A2540"
++        case 0x0315: return "Siri Remote A2854"
++        default: return "Siri Remote"
++        }
+     }
+ 
+     private func intProp(_ device: IOHIDDevice, _ key: String) -> Int? {
+diff --git a/iRemote/VoiceCapture/RemoteAssistantClient.swift b/iRemote/VoiceCapture/RemoteAssistantClient.swift
+new file mode 100644
+index 0000000..26da35c
+--- /dev/null
++++ b/iRemote/VoiceCapture/RemoteAssistantClient.swift
+@@ -0,0 +1,110 @@
++import Foundation
++
++struct RemoteAssistantError: LocalizedError {
++    let message: String
++    var errorDescription: String? { message }
++}
++
++final class RemoteAssistantClient {
++    private struct Request: Encodable {
++        let transcript: String
++    }
++
++    private struct Response: Decodable {
++        let response: String?
++        let error: String?
++    }
++
++    private struct SpeechRequest: Encodable {
++        let text: String
++    }
++
++    private let endpoint: URL?
++    private let keyFile: String
++    private let ttsEndpoint: URL?
++    private let ttsCommand: String
++
++    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
++        endpoint = environment["IREMOTE_ASSISTANT_URL"].flatMap(URL.init(string:))
++        keyFile = environment["IREMOTE_CLEANER_KEY_FILE"] ?? ""
++        ttsEndpoint = environment["IREMOTE_TTS_URL"].flatMap(URL.init(string:))
++        ttsCommand = environment["IREMOTE_TTS_COMMAND"] ?? ""
++    }
++
++    var isConfigured: Bool {
++        endpoint != nil && !keyFile.isEmpty
++    }
++
++    func assist(_ transcript: String) async throws -> String {
++        guard let endpoint else {
++            throw RemoteAssistantError(message: "The voice assistant bridge is not configured.")
++        }
++        let key = try String(contentsOfFile: keyFile, encoding: .utf8)
++            .trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !key.isEmpty else {
++            throw RemoteAssistantError(message: "The voice assistant key is empty.")
++        }
++
++        var request = URLRequest(url: endpoint)
++        request.httpMethod = "POST"
++        request.timeoutInterval = 95
++        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
++        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
++        request.httpBody = try JSONEncoder().encode(Request(transcript: transcript))
++
++        let (data, response) = try await URLSession.shared.data(for: request)
++        guard let http = response as? HTTPURLResponse else {
++            throw RemoteAssistantError(message: "The voice assistant returned no HTTP response.")
++        }
++        let decoded = try JSONDecoder().decode(Response.self, from: data)
++        guard (200..<300).contains(http.statusCode),
++              let answer = decoded.response?.trimmingCharacters(in: .whitespacesAndNewlines),
++              !answer.isEmpty else {
++            throw RemoteAssistantError(
++                message: decoded.error ?? "The voice assistant failed (HTTP \(http.statusCode))."
++            )
++        }
++        return answer
++    }
++
++    func speak(_ text: String) {
++        let spokenText = String(text.prefix(600))
++        if let ttsEndpoint {
++            let keyFile = keyFile
++            Task.detached(priority: .utility) {
++                do {
++                    let key = try String(contentsOfFile: keyFile, encoding: .utf8)
++                        .trimmingCharacters(in: .whitespacesAndNewlines)
++                    guard !key.isEmpty else { return }
++                    var request = URLRequest(url: ttsEndpoint)
++                    request.httpMethod = "POST"
++                    request.timeoutInterval = 95
++                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
++                    request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
++                    request.httpBody = try JSONEncoder().encode(SpeechRequest(text: spokenText))
++                    _ = try await URLSession.shared.data(for: request)
++                } catch {
++                    // Spoken feedback is optional; the overlay still carries the answer.
++                }
++            }
++            return
++        }
++
++        let command = ttsCommand
++        guard !command.isEmpty,
++              FileManager.default.isExecutableFile(atPath: command) else { return }
++        Task.detached(priority: .utility) {
++            let process = Process()
++            process.executableURL = URL(fileURLWithPath: command)
++            process.arguments = ["-q", spokenText]
++            process.standardOutput = FileHandle.nullDevice
++            process.standardError = FileHandle.nullDevice
++            do {
++                try process.run()
++                process.waitUntilExit()
++            } catch {
++                // Spoken feedback is optional; the overlay still carries the answer.
++            }
++        }
++    }
++}
+diff --git a/iRemote/VoiceCapture/RemoteDictationService.swift b/iRemote/VoiceCapture/RemoteDictationService.swift
+index 4c6c3cb..0c09054 100644
+--- a/iRemote/VoiceCapture/RemoteDictationService.swift
++++ b/iRemote/VoiceCapture/RemoteDictationService.swift
+@@ -7,6 +7,7 @@ struct RemoteDictationResult {
+     let workDir: String?
+     let rawOutput: String
+     let opusFrameCount: Int
++    let editMode: String?
+ }
+ 
+ enum RemoteListenerEvent {
+@@ -14,6 +15,9 @@ enum RemoteListenerEvent {
+     case captureActive(Int)
+     case recording
+     case transcribing
++    case partialTranscript(String)
++    case streamingReady
++    case streamingUnavailable(String)
+     case result(RemoteDictationResult)
+     case failed(String)
+     case stopped
+@@ -150,6 +154,11 @@ final class RemoteDictationService {
+     let packetLoggerPath: String
+     let scriptPath: String
+     let whisperCLIPath: String
++    let parakeetCLIPath: String
++    let parakeetModelDir: String
++    let cleanerURL: String
++    let cleanerKeyFile: String
++    let streamingModelDir: String
+     /// Mutable so the user can switch active models at runtime via
+     /// `ModelManagerWindowController` without restarting the app. The
+     /// next `transcribe(...)` call picks up the new path
+@@ -177,7 +186,7 @@ final class RemoteDictationService {
+     /// The Mandarin sentences below are *functional* — removing them
+     /// would noticeably degrade Chinese transcription quality. They
+     /// are intentionally retained.
+-    fileprivate static let punctuationPrompt =
++    fileprivate nonisolated static let punctuationPrompt =
+         "你好，我叫小王，今天天气很好，我打算去公园散步，顺便买点水果，回家做饭。" +
+         "逗号、句号、问号、感叹号、顿号、冒号都是标点符号。" +
+         "Hello, my name is Sam, and the weather is great."
+@@ -193,11 +202,17 @@ final class RemoteDictationService {
+     private var micButtonHeld = false
+     private var voiceMonitor: RemotePklgVoiceMonitor?
+     private var streamFinalizeTask: Task<Void, Never>?
++    private var streamingTail: Task<Void, Never>?
++    private var streamingTranscriber: RemoteStreamingTranscriber?
++    private var streamingReady = false
++    private var streamingUtteranceActive = false
++    private var streamingFailed = false
+     private var activeRollingWorkDir: String?
+     private var eventHandler: ((RemoteListenerEvent) -> Void)?
+     private var isListening = false
+     private var isFinalizing = false
+     private var finalizeArmed = false
++    private var suppressVoiceFrames = false
+     private let autoFinalizeNanos: UInt64 = 900_000_000
+     private let releaseFinalizeNanos: UInt64 = 350_000_000
+ 
+@@ -220,10 +235,16 @@ final class RemoteDictationService {
+             ?? "\(self.projectRoot)/Tools/remote-dictate-once.sh"
+         self.whisperCLIPath = env["IREMOTE_WHISPER_CLI"]
+             ?? Self.locateWhisperCLI()
++        self.parakeetCLIPath = env["IREMOTE_PARAKEET_CLI"] ?? ""
++        self.parakeetModelDir = env["IREMOTE_PARAKEET_MODEL_DIR"] ?? ""
++        self.cleanerURL = env["IREMOTE_CLEANER_URL"] ?? ""
++        self.cleanerKeyFile = env["IREMOTE_CLEANER_KEY_FILE"] ?? ""
++        self.streamingModelDir = env["IREMOTE_STREAMING_MODEL_DIR"] ?? ""
+         // Active-model resolution order: IREMOTE_WHISPER_MODEL env
+         // override → UserDefaults selection (set by the model
+         // manager) → built-in default ggml-small.bin.
+-        self.whisperModelPath = WhisperModelStore.activeModelPath()
++        self.whisperModelPath = env["IREMOTE_WHISPER_MODEL"]
++            ?? WhisperModelStore.activeModelPath()
+         self.language = env["IREMOTE_WHISPER_LANG"]
+             ?? (Self.isEnglishOnlyModel(self.whisperModelPath) ? "en" : "auto")
+     }
+@@ -305,33 +326,51 @@ final class RemoteDictationService {
+         lines.append(fm.isExecutableFile(atPath: packetLoggerPath)
+                      ? "Remote capture: PacketLogger ready"
+                      : "Remote capture: PacketLogger missing")
+-        lines.append(fm.isExecutableFile(atPath: whisperCLIPath)
+-                     ? "Whisper CLI: ready"
+-                     : "Whisper CLI: missing")
+-
+-        if fm.fileExists(atPath: whisperModelPath) {
+-            let modelName = URL(fileURLWithPath: whisperModelPath).lastPathComponent
+-            lines.append("Model: \(modelName)")
+-            if modelName != "ggml-small.bin" {
+-                lines.append("Accuracy: install ggml-small.bin; current model is lower quality")
++        if parakeetIsReady {
++            lines.append("ASR: Parakeet v3 Core ML ready")
++        } else {
++            lines.append(fm.isExecutableFile(atPath: whisperCLIPath)
++                         ? "Fallback ASR: Whisper CLI ready"
++                         : "Fallback ASR: Whisper CLI missing")
++            if fm.fileExists(atPath: whisperModelPath) {
++                lines.append("Fallback model: \(URL(fileURLWithPath: whisperModelPath).lastPathComponent)")
++            } else {
++                lines.append("Fallback model: missing \(URL(fileURLWithPath: whisperModelPath).lastPathComponent)")
+             }
++        }
++
++        if fm.fileExists(atPath: streamingModelDir) {
++            lines.append("Live captions: Parakeet 160ms configured")
+         } else {
+-            lines.append("Model: missing \(URL(fileURLWithPath: whisperModelPath).lastPathComponent)")
++            lines.append("Live captions: unavailable; final transcription only")
+         }
+ 
++        let cleanerConfigured = !cleanerURL.isEmpty && fm.fileExists(atPath: cleanerKeyFile)
++        lines.append(cleanerConfigured
++                     ? "Audio editor: Gemma 4 E4B MLX configured"
++                     : "Cleanup: verbatim transcripts")
++
+         lines.append(FileManager.default.isExecutableFile(atPath: captureHelperPath)
+                      ? "Remote trigger helper: installed"
+                      : "Remote trigger helper: will ask once to install")
+         return lines
+     }
+ 
++    private var parakeetIsReady: Bool {
++        FileManager.default.isExecutableFile(atPath: parakeetCLIPath)
++            && FileManager.default.fileExists(atPath: parakeetModelDir)
++    }
++
+     var readinessProblem: String? {
+         let fm = FileManager.default
+         if !fm.isExecutableFile(atPath: packetLoggerPath) {
+             return "PacketLogger CLI not found"
+         }
++        if parakeetIsReady {
++            return nil
++        }
+         if !fm.isExecutableFile(atPath: whisperCLIPath) {
+-            return "Whisper CLI not found"
++            return "No local ASR engine found"
+         }
+         if !fm.fileExists(atPath: whisperModelPath) {
+             return "Whisper model not found: \(URL(fileURLWithPath: whisperModelPath).lastPathComponent)"
+@@ -401,6 +440,7 @@ final class RemoteDictationService {
+         let language = self.language
+ 
+         return try await Task.detached(priority: .userInitiated) {
++            defer { try? FileManager.default.removeItem(atPath: workDir) }
+             _ = try Self.runExecutable("/usr/bin/sudo", arguments: ["-n", helperPath, "stop", workDir])
+             return try Self.transcribeCapturedPklg(
+                 workDir: workDir,
+@@ -414,12 +454,114 @@ final class RemoteDictationService {
+         }.value
+     }
+ 
++    private func prepareStreamingIfConfigured() {
++        guard streamingTranscriber == nil,
++              FileManager.default.fileExists(atPath: streamingModelDir) else { return }
++
++        do {
++            let transcriber = try RemoteStreamingTranscriber(
++                modelDirectory: URL(fileURLWithPath: streamingModelDir)
++            ) { [weak self] transcript in
++                Self.dispatchOnMainAllModes { [weak self] in
++                    MainActor.assumeIsolated {
++                        guard let self, self.streamingUtteranceActive else { return }
++                        self.eventHandler?(.partialTranscript(transcript))
++                    }
++                }
++            }
++            streamingTranscriber = transcriber
++            Task { [weak self] in
++                do {
++                    try await transcriber.load()
++                    guard let self, self.isListening else { return }
++                    self.streamingReady = true
++                    self.eventHandler?(.streamingReady)
++                } catch {
++                    guard let self else { return }
++                    self.streamingReady = false
++                    self.eventHandler?(.streamingUnavailable(error.localizedDescription))
++                }
++            }
++        } catch {
++            streamingReady = false
++            eventHandler?(.streamingUnavailable(error.localizedDescription))
++        }
++    }
++
++    private func beginStreamingUtteranceIfNeeded() {
++        guard streamingReady,
++              !streamingUtteranceActive,
++              let transcriber = streamingTranscriber else { return }
++
++        streamingUtteranceActive = true
++        streamingFailed = false
++        let previous = streamingTail
++        streamingTail = Task { [weak self] in
++            await previous?.value
++            guard let self, !self.streamingFailed else { return }
++            await transcriber.begin()
++        }
++    }
++
++    private func enqueueStreamingFrame(_ frame: Data) {
++        guard streamingUtteranceActive,
++              !streamingFailed,
++              let transcriber = streamingTranscriber else { return }
++
++        let previous = streamingTail
++        streamingTail = Task { [weak self] in
++            await previous?.value
++            guard let self, !self.streamingFailed else { return }
++            do {
++                try await transcriber.append(opusFrame: frame)
++            } catch {
++                self.streamingFailed = true
++                await transcriber.cancel()
++            }
++        }
++    }
++
++    private func finishStreamingUtterance() async -> String? {
++        guard streamingUtteranceActive,
++              let transcriber = streamingTranscriber else { return nil }
++
++        let pending = streamingTail
++        await pending?.value
++        streamingTail = nil
++        streamingUtteranceActive = false
++
++        guard !streamingFailed else {
++            await transcriber.cancel()
++            streamingFailed = false
++            return nil
++        }
++
++        do {
++            let transcript = try await transcriber.finish()
++            return transcript.isEmpty ? nil : transcript
++        } catch {
++            await transcriber.cancel()
++            return nil
++        }
++    }
++
++    private func cancelStreamingUtterance() {
++        streamingTail?.cancel()
++        streamingTail = nil
++        streamingUtteranceActive = false
++        streamingFailed = false
++        if let transcriber = streamingTranscriber {
++            Task { await transcriber.cancel() }
++        }
++    }
++
+     func startContinuousListening(onEvent: @escaping (RemoteListenerEvent) -> Void) {
+         guard !isListening else { return }
+         eventHandler = onEvent
+         isListening = true
++        prepareStreamingIfConfigured()
+         Self.cleanupRollingCaptureDirs(keeping: rollingWorkDir)
+-        Self.pruneUtteranceDirs(maxCount: 8)
++        Self.pruneUtteranceDirs(maxCount: 0)
+ 
+         voiceMonitor?.stop()
+         Task { [weak self] in
+@@ -442,6 +584,7 @@ final class RemoteDictationService {
+         voiceMonitor = nil
+         streamFinalizeTask?.cancel()
+         streamFinalizeTask = nil
++        cancelStreamingUtterance()
+         micButtonHeld = false
+ 
+         let helperPath = captureHelperPath
+@@ -525,8 +668,10 @@ final class RemoteDictationService {
+     func setRemoteMicButtonDown(_ isDown: Bool) -> Bool {
+         micButtonHeld = isDown
+         if isDown {
++            suppressVoiceFrames = false
+             finalizeArmed = false
+             streamFinalizeTask?.cancel()
++            beginStreamingUtteranceIfNeeded()
+             if isListening, currentFrames.isEmpty, !isFinalizing {
+                 eventHandler?(.recording)
+             }
+@@ -541,11 +686,25 @@ final class RemoteDictationService {
+         return !currentFrames.isEmpty
+     }
+ 
++    /// Discards a short button tap used only to arm assistant mode. Frame
++    /// suppression lasts until the next deliberate Siri-button press, keeping
++    /// PacketLogger's late buffered packets from becoming a tiny dictation.
++    func cancelCurrentUtterance() {
++        micButtonHeld = false
++        suppressVoiceFrames = true
++        finalizeArmed = false
++        streamFinalizeTask?.cancel()
++        currentFrames.removeAll()
++        cancelStreamingUtterance()
++    }
++
+     private func handleRemoteVoiceFrame(_ frame: Data) {
+-        guard !frame.isEmpty else { return }
++        guard !frame.isEmpty, !suppressVoiceFrames else { return }
+ 
+         let wasEmpty = currentFrames.isEmpty
+         currentFrames.append(frame)
++        beginStreamingUtteranceIfNeeded()
++        enqueueStreamingFrame(frame)
+         if wasEmpty, !finalizeArmed {
+             // Only emit .recording for a fresh utterance — not for late
+             // PacketLogger flushes arriving after mic release.
+@@ -605,7 +764,8 @@ final class RemoteDictationService {
+             processedWavPath: nil,
+             workDir: workDir,
+             rawOutput: output,
+-            opusFrameCount: 0
++            opusFrameCount: 0,
++            editMode: nil
+         )
+     }
+ 
+@@ -623,7 +783,11 @@ final class RemoteDictationService {
+         eventHandler?(.transcribing)
+ 
+         do {
+-            let result = try await transcribe(opusFrames: frames)
++            let streamingTranscript = await finishStreamingUtterance()
++            let result = try await transcribe(
++                opusFrames: frames,
++                preferredTranscript: streamingTranscript
++            )
+             eventHandler?(.result(result))
+         } catch {
+             eventHandler?(.failed(error.localizedDescription))
+@@ -631,76 +795,181 @@ final class RemoteDictationService {
+         isFinalizing = false
+     }
+ 
+-    private func transcribe(opusFrames: [Data]) async throws -> RemoteDictationResult {
++    private func transcribe(
++        opusFrames: [Data],
++        preferredTranscript: String? = nil
++    ) async throws -> RemoteDictationResult {
+         let projectRoot = self.projectRoot
+         let decoderPath = self.decoderPath
+         let whisperCLIPath = self.whisperCLIPath
+         let whisperModelPath = self.whisperModelPath
++        let parakeetCLIPath = self.parakeetCLIPath
++        let parakeetModelDir = self.parakeetModelDir
++        let cleanerURL = self.cleanerURL
++        let cleanerKeyFile = self.cleanerKeyFile
+         let language = self.language
+ 
+         return try await Task.detached(priority: .userInitiated) {
+             let runID = UUID().uuidString
+             let workDir = "/tmp/iremote-utt-\(runID)"
+             try FileManager.default.createDirectory(atPath: workDir, withIntermediateDirectories: true)
++            defer { try? FileManager.default.removeItem(atPath: workDir) }
+ 
+             let opusPath = "\(workDir)/remote-opus.bin"
+             let wavPath = "\(workDir)/remote-raw.wav"
+             let processedWavPath = "\(workDir)/remote-voice.wav"
+             let whisperWavPath = "\(workDir)/remote-whisper.wav"
+-            let transcriptPath = "\(workDir)/transcript.txt"
+-
+-            try Self.writeLengthPrefixedOpus(opusFrames, to: opusPath)
+-            try Self.ensureDecoderCompiled(projectRoot: projectRoot, decoderPath: decoderPath)
+-            _ = try Self.runExecutable(decoderPath, arguments: [opusPath, wavPath])
++            var decodedAudioReady = false
++
++            func decodeRemoteAudio() throws {
++                guard !decodedAudioReady else { return }
++                try Self.writeLengthPrefixedOpus(opusFrames, to: opusPath)
++                try Self.ensureDecoderCompiled(projectRoot: projectRoot, decoderPath: decoderPath)
++                _ = try Self.runExecutable(decoderPath, arguments: [opusPath, wavPath])
++                decodedAudioReady = true
++            }
+ 
+-            let inputForWhisper = try Self.prepareAudioForWhisper(
+-                rawWavPath: wavPath,
+-                cleanedWavPath: processedWavPath,
+-                fallbackWavPath: whisperWavPath
+-            )
++            let streamingFallback = preferredTranscript?
++                .trimmingCharacters(in: .whitespacesAndNewlines)
++            try decodeRemoteAudio()
++
++            let rawTranscript: String
++            if FileManager.default.isExecutableFile(atPath: parakeetCLIPath),
++               FileManager.default.fileExists(atPath: parakeetModelDir) {
++                do {
++                    rawTranscript = try Self.transcribeWithParakeet(
++                        audioPath: wavPath,
++                        workDir: workDir,
++                        cliPath: parakeetCLIPath,
++                        modelDir: parakeetModelDir,
++                        language: language
++                    )
++                } catch {
++                    guard let streamingFallback, !streamingFallback.isEmpty else { throw error }
++                    rawTranscript = streamingFallback
++                }
++            } else if let streamingFallback, !streamingFallback.isEmpty {
++                rawTranscript = streamingFallback
++            } else {
++                let inputForWhisper = try Self.prepareAudioForWhisper(
++                    rawWavPath: wavPath,
++                    cleanedWavPath: processedWavPath,
++                    fallbackWavPath: whisperWavPath
++                )
++                rawTranscript = try Self.runExecutable(
++                    whisperCLIPath,
++                    arguments: [
++                        "-m", whisperModelPath,
++                        "-f", inputForWhisper,
++                        "-l", language,
++                        "-t", "4",
++                        "-nt",
++                        "--no-prints",
++                        "--prompt", Self.punctuationPrompt,
++                    ]
++                )
++            }
+ 
+-            let rawTranscript = try Self.runExecutable(
+-                whisperCLIPath,
+-                arguments: [
+-                    "-m", whisperModelPath,
+-                    "-f", inputForWhisper,
+-                    "-l", language,
+-                    "-t", "4",
+-                    // GPU on (Metal): ~5x faster than CPU-only on Apple
+-                    // Silicon for the small model. Do NOT pass -ng here.
+-                    "-nt",
+-                    "--no-prints",
+-                    "--prompt", Self.punctuationPrompt,
+-                ]
+-            )
+-            let cleaned = Self.cleanTranscript(rawTranscript)
+-            try cleaned.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
+-            try? Self.publishLatestArtifacts(
+-                projectRoot: projectRoot,
+-                rawWavPath: wavPath,
+-                processedWavPath: inputForWhisper == wavPath ? nil : inputForWhisper,
+-                transcriptPath: transcriptPath,
+-                whisperModelPath: whisperModelPath,
+-                language: language,
+-                opusFrameCount: opusFrames.count
++            let verbatim = Self.cleanTranscript(rawTranscript)
++            let edited = Self.cleanTranscriptWithLocalModel(
++                verbatim,
++                workDir: workDir,
++                cleanerURL: cleanerURL,
++                keyFile: cleanerKeyFile,
++                audioPath: decodedAudioReady ? wavPath : nil
+             )
+-            Self.pruneUtteranceDirs(maxCount: 8)
+ 
+-            guard !cleaned.isEmpty else {
++            guard !edited.text.isEmpty else {
+                 throw RemoteDictationServiceError.emptyTranscript("No transcript produced")
+             }
+ 
+             return RemoteDictationResult(
+-                transcript: cleaned,
+-                wavPath: wavPath,
+-                processedWavPath: inputForWhisper == wavPath ? nil : inputForWhisper,
+-                workDir: workDir,
++                transcript: edited.text,
++                wavPath: nil,
++                processedWavPath: nil,
++                workDir: nil,
+                 rawOutput: rawTranscript,
+-                opusFrameCount: opusFrames.count
++                opusFrameCount: opusFrames.count,
++                editMode: edited.mode
+             )
+         }.value
+     }
+ 
++    private nonisolated static func transcribeWithParakeet(
++        audioPath: String,
++        workDir: String,
++        cliPath: String,
++        modelDir: String,
++        language: String
++    ) throws -> String {
++        let outputPath = "\(workDir)/parakeet.json"
++        _ = try runExecutable(
++            cliPath,
++            arguments: [
++                "transcribe", audioPath,
++                "--model-version", "v3",
++                "--model-dir", modelDir,
++                "--language", language == "auto" ? "en" : language,
++                "--output-json", outputPath,
++            ]
++        )
++        let data = try Data(contentsOf: URL(fileURLWithPath: outputPath))
++        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let text = object["text"] as? String,
++              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
++            throw RemoteDictationServiceError.emptyTranscript("Parakeet produced no transcript")
++        }
++        return text
++    }
++
++    private nonisolated static func cleanTranscriptWithLocalModel(
++        _ transcript: String,
++        workDir: String,
++        cleanerURL: String,
++        keyFile: String,
++        audioPath: String?
++    ) -> (text: String, mode: String?) {
++        guard !cleanerURL.isEmpty,
++              FileManager.default.fileExists(atPath: keyFile),
++              let key = try? String(contentsOfFile: keyFile, encoding: .utf8)
++                .trimmingCharacters(in: .whitespacesAndNewlines),
++              key.count >= 32 else {
++            return (transcript, nil)
++        }
++
++        do {
++            let requestPath = "\(workDir)/cleanup-request.json"
++            var payload: [String: Any] = ["text": transcript]
++            if let audioPath {
++                payload["audio_path"] = audioPath
++            }
++            let request = try JSONSerialization.data(withJSONObject: payload)
++            try request.write(to: URL(fileURLWithPath: requestPath), options: .atomic)
++            let response = try runExecutable(
++                "/usr/bin/curl",
++                arguments: [
++                    "--fail", "--silent", "--show-error",
++                    "--max-time", "20",
++                    "--header", "Authorization: Bearer \(key)",
++                    "--header", "Content-Type: application/json",
++                    "--data-binary", "@\(requestPath)",
++                    cleanerURL,
++                ]
++            )
++            guard let data = response.data(using: .utf8),
++                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
++                  object["accepted"] as? Bool == true,
++                  let cleaned = object["text"] as? String,
++                  !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
++                return (transcript, nil)
++            }
++            let mode = object["mode"] as? String
++            return (cleaned.trimmingCharacters(in: .whitespacesAndNewlines), mode)
++        } catch {
++            return (transcript, nil)
++        }
++    }
++
+     private nonisolated static func captureHelperReady(_ helperPath: String) async -> Bool {
+         await Task.detached {
+             do {
+@@ -990,7 +1259,6 @@ final class RemoteDictationService {
+         let wavPath = "\(workDir)/remote-raw.wav"
+         let processedWavPath = "\(workDir)/remote-voice.wav"
+         let whisperWavPath = "\(workDir)/remote-whisper.wav"
+-        let transcriptPath = "\(workDir)/transcript.txt"
+         let packetLoggerLog = Self.readTextIfExists("\(workDir)/packetlogger.log")
+ 
+         guard FileManager.default.fileExists(atPath: pklgPath) else {
+@@ -1028,26 +1296,17 @@ final class RemoteDictationService {
+             ]
+         )
+         let cleaned = cleanTranscript(rawTranscript)
+-        try cleaned.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
+-        try? publishLatestArtifacts(
+-            projectRoot: projectRoot,
+-            rawWavPath: wavPath,
+-            processedWavPath: inputForWhisper == wavPath ? nil : inputForWhisper,
+-            transcriptPath: transcriptPath,
+-            whisperModelPath: whisperModelPath,
+-            language: language,
+-            opusFrameCount: 0
+-        )
+         guard !cleaned.isEmpty else {
+             throw RemoteDictationServiceError.emptyTranscript("No transcript produced")
+         }
+         return RemoteDictationResult(
+             transcript: cleaned,
+-            wavPath: wavPath,
+-            processedWavPath: inputForWhisper == wavPath ? nil : inputForWhisper,
+-            workDir: workDir,
++            wavPath: nil,
++            processedWavPath: nil,
++            workDir: nil,
+             rawOutput: rawTranscript,
+-            opusFrameCount: 0
++            opusFrameCount: 0,
++            editMode: nil
+         )
+     }
+ 
+diff --git a/iRemote/VoiceCapture/RemoteOpusDecoder.c b/iRemote/VoiceCapture/RemoteOpusDecoder.c
+new file mode 100644
+index 0000000..81c73fe
+--- /dev/null
++++ b/iRemote/VoiceCapture/RemoteOpusDecoder.c
+@@ -0,0 +1,80 @@
++#include "RemoteOpusDecoder.h"
++
++#include <opus/opus.h>
++#include <stdlib.h>
++
++struct RemoteOpusDecoder {
++    OpusDecoder *opus;
++};
++
++RemoteOpusDecoder *remote_opus_decoder_create(int32_t *error_code) {
++    int error = OPUS_OK;
++    OpusDecoder *opus = opus_decoder_create(16000, 1, &error);
++    if (error_code != NULL) {
++        *error_code = error;
++    }
++    if (opus == NULL || error != OPUS_OK) {
++        if (opus != NULL) {
++            opus_decoder_destroy(opus);
++        }
++        return NULL;
++    }
++
++    RemoteOpusDecoder *decoder = calloc(1, sizeof(RemoteOpusDecoder));
++    if (decoder == NULL) {
++        opus_decoder_destroy(opus);
++        if (error_code != NULL) {
++            *error_code = OPUS_ALLOC_FAIL;
++        }
++        return NULL;
++    }
++    decoder->opus = opus;
++    return decoder;
++}
++
++void remote_opus_decoder_destroy(RemoteOpusDecoder *decoder) {
++    if (decoder == NULL) {
++        return;
++    }
++    if (decoder->opus != NULL) {
++        opus_decoder_destroy(decoder->opus);
++    }
++    free(decoder);
++}
++
++int32_t remote_opus_decoder_reset(RemoteOpusDecoder *decoder) {
++    if (decoder == NULL || decoder->opus == NULL) {
++        return OPUS_BAD_ARG;
++    }
++    return opus_decoder_ctl(decoder->opus, OPUS_RESET_STATE);
++}
++
++int32_t remote_opus_decoder_decode(
++    RemoteOpusDecoder *decoder,
++    const uint8_t *packet,
++    int32_t packet_length,
++    float *pcm,
++    int32_t pcm_capacity
++) {
++    if (decoder == NULL || decoder->opus == NULL || packet == NULL ||
++        packet_length <= 0 || pcm == NULL || pcm_capacity <= 0) {
++        return OPUS_BAD_ARG;
++    }
++
++    int samples = opus_packet_get_nb_samples(packet, packet_length, 16000);
++    if (samples < 0) {
++        return samples;
++    }
++    if (samples > pcm_capacity) {
++        return OPUS_BUFFER_TOO_SMALL;
++    }
++
++    return opus_decode_float(
++        decoder->opus,
++        packet,
++        packet_length,
++        pcm,
++        pcm_capacity,
++        0
++    );
++}
+diff --git a/iRemote/VoiceCapture/RemoteOpusDecoder.h b/iRemote/VoiceCapture/RemoteOpusDecoder.h
+new file mode 100644
+index 0000000..6ded8c9
+--- /dev/null
++++ b/iRemote/VoiceCapture/RemoteOpusDecoder.h
+@@ -0,0 +1,27 @@
++#ifndef RemoteOpusDecoder_h
++#define RemoteOpusDecoder_h
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct RemoteOpusDecoder RemoteOpusDecoder;
++
++RemoteOpusDecoder *remote_opus_decoder_create(int32_t *error_code);
++void remote_opus_decoder_destroy(RemoteOpusDecoder *decoder);
++int32_t remote_opus_decoder_reset(RemoteOpusDecoder *decoder);
++int32_t remote_opus_decoder_decode(
++    RemoteOpusDecoder *decoder,
++    const uint8_t *packet,
++    int32_t packet_length,
++    float *pcm,
++    int32_t pcm_capacity
++);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/iRemote/VoiceCapture/RemotePklgVoiceMonitor.swift b/iRemote/VoiceCapture/RemotePklgVoiceMonitor.swift
+index 7a4033d..59c3ebf 100644
+--- a/iRemote/VoiceCapture/RemotePklgVoiceMonitor.swift
++++ b/iRemote/VoiceCapture/RemotePklgVoiceMonitor.swift
+@@ -22,7 +22,8 @@ final class RemotePklgVoiceMonitor {
+         var collected: Data
+     }
+ 
+-    private static let voiceAttHandle: UInt16 = 0x0023
++    private static let legacyVoiceAttHandle: UInt16 = 0x0023
++    private static let modernVoiceAttHandles: Set<UInt16> = [0x0035, 0x0036]
+     private static let hidReportLength = 101
+     private static let voicePacketLengthOffset = 6
+     private static let voicePacketPayloadOffset = 7
+@@ -195,10 +196,14 @@ final class RemotePklgVoiceMonitor {
+         guard pdu.collected.count + pdu.valueTruncated >= pdu.valueExpected else { return }
+         inflight.removeValue(forKey: connHandle)
+ 
+-        guard pdu.attHandle == Self.voiceAttHandle else { return }
+         guard pdu.valueTruncated == 0 else { return }
+ 
+         let value = pdu.collected
++        if Self.modernVoiceAttHandles.contains(pdu.attHandle) {
++            parseModernVoiceFrame(value, onFrame: onFrame)
++            return
++        }
++        guard pdu.attHandle == Self.legacyVoiceAttHandle else { return }
+ 
+         // Button report: 2 bytes, byte 0 == 0x00. Byte 1 carries the button
+         // code/bitmap (0x20 = MENU press, 0x00 = release).
+@@ -246,6 +251,20 @@ final class RemotePklgVoiceMonitor {
+         onFrame(value.subdata(in: payloadStart..<packetEnd))
+     }
+ 
++    /// A2540/A2854 notifications use a shorter wrapper than the glass remote:
++    /// two unknown bytes, a little-endian sequence, one Opus length byte, then
++    /// a 48 kHz mono CELT frame whose TOC byte is 0xB8.
++    private func parseModernVoiceFrame(_ value: Data, onFrame: (Data) -> Void) {
++        guard value.count >= 7 else { return }
++        let opusLength = Int(value[value.startIndex + 4])
++        let payloadStart = value.startIndex + 5
++        let packetEnd = payloadStart + opusLength
++        guard opusLength >= 2,
++              packetEnd <= value.endIndex,
++              value[payloadStart] == 0xB8 else { return }
++        onFrame(value.subdata(in: payloadStart..<packetEnd))
++    }
++
+     private static func be32(_ d: Data, _ offset: Int) -> UInt32 {
+         (UInt32(d[offset]) << 24) | (UInt32(d[offset + 1]) << 16) | (UInt32(d[offset + 2]) << 8) | UInt32(d[offset + 3])
+     }
+diff --git a/iRemote/VoiceCapture/RemoteStreamingTranscriber.swift b/iRemote/VoiceCapture/RemoteStreamingTranscriber.swift
+new file mode 100644
+index 0000000..ce44fe3
+--- /dev/null
++++ b/iRemote/VoiceCapture/RemoteStreamingTranscriber.swift
+@@ -0,0 +1,144 @@
++import AVFoundation
++import CoreML
++import FluidAudio
++import Foundation
++
++enum RemoteStreamingTranscriberError: LocalizedError {
++    case opusInitialization(Int32)
++    case opusDecode(Int32)
++    case audioBufferAllocation
++
++    var errorDescription: String? {
++        switch self {
++        case .opusInitialization(let code):
++            return "Unable to initialize streaming Opus decoder (\(code))"
++        case .opusDecode(let code):
++            return "Unable to decode streaming Opus frame (\(code))"
++        case .audioBufferAllocation:
++            return "Unable to allocate streaming audio buffer"
++        }
++    }
++}
++
++private final class RemoteOpusDecoderBox: @unchecked Sendable {
++    let pointer: OpaquePointer
++
++    init() throws {
++        var error: Int32 = 0
++        guard let pointer = remote_opus_decoder_create(&error) else {
++            throw RemoteStreamingTranscriberError.opusInitialization(error)
++        }
++        self.pointer = pointer
++    }
++
++    deinit {
++        remote_opus_decoder_destroy(pointer)
++    }
++
++    func reset() {
++        _ = remote_opus_decoder_reset(pointer)
++    }
++}
++
++/// Owns one ordered Opus → PCM → Parakeet streaming session.
++/// All audio and model state remain in memory and are actor-isolated.
++actor RemoteStreamingTranscriber {
++    private let manager: StreamingEouAsrManager
++    private let decoder: RemoteOpusDecoderBox
++    private let modelDirectory: URL
++    private let onPartial: @Sendable (String) -> Void
++    private let format: AVAudioFormat
++    private var active = false
++    private var consecutiveDecodeFailures = 0
++
++    init(modelDirectory: URL, onPartial: @escaping @Sendable (String) -> Void) throws {
++        guard let format = AVAudioFormat(
++            commonFormat: .pcmFormatFloat32,
++            sampleRate: 16_000,
++            channels: 1,
++            interleaved: false
++        ) else {
++            throw RemoteStreamingTranscriberError.audioBufferAllocation
++        }
++        self.format = format
++        self.modelDirectory = modelDirectory
++        self.onPartial = onPartial
++        self.decoder = try RemoteOpusDecoderBox()
++
++        let configuration = MLModelConfiguration()
++        configuration.computeUnits = .all
++        self.manager = StreamingEouAsrManager(
++            configuration: configuration,
++            chunkSize: .ms160,
++            eouDebounceMs: 1_280
++        )
++    }
++
++    func load() async throws {
++        try await manager.loadModels(from: modelDirectory)
++        await manager.setPartialCallback { [onPartial] transcript in
++            onPartial(transcript)
++        }
++    }
++
++    func begin() async {
++        decoder.reset()
++        consecutiveDecodeFailures = 0
++        active = true
++        await manager.reset()
++    }
++
++    func append(opusFrame: Data) async throws {
++        guard active else { return }
++
++        var samples = [Float](repeating: 0, count: 1_920)
++        let decoded: Int32 = opusFrame.withUnsafeBytes { bytes in
++            guard let baseAddress = bytes.bindMemory(to: UInt8.self).baseAddress else {
++                return -1
++            }
++            return remote_opus_decoder_decode(
++                decoder.pointer,
++                baseAddress,
++                Int32(opusFrame.count),
++                &samples,
++                Int32(samples.count)
++            )
++        }
++
++        guard decoded > 0 else {
++            consecutiveDecodeFailures += 1
++            if consecutiveDecodeFailures >= 5 {
++                throw RemoteStreamingTranscriberError.opusDecode(decoded)
++            }
++            return
++        }
++        consecutiveDecodeFailures = 0
++
++        guard let buffer = AVAudioPCMBuffer(
++            pcmFormat: format,
++            frameCapacity: AVAudioFrameCount(decoded)
++        ), let channel = buffer.floatChannelData?[0] else {
++            throw RemoteStreamingTranscriberError.audioBufferAllocation
++        }
++        buffer.frameLength = AVAudioFrameCount(decoded)
++        samples.withUnsafeBufferPointer { source in
++            channel.update(from: source.baseAddress!, count: Int(decoded))
++        }
++        _ = try await manager.process(audioBuffer: buffer)
++    }
++
++    func finish() async throws -> String {
++        guard active else { return "" }
++        active = false
++        let transcript = try await manager.finish()
++        decoder.reset()
++        return transcript.trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    func cancel() async {
++        active = false
++        decoder.reset()
++        consecutiveDecodeFailures = 0
++        await manager.reset()
++    }
++}
+diff --git a/iRemote/iRemote-Bridging-Header.h b/iRemote/iRemote-Bridging-Header.h
+index 2963ece..332240d 100644
+--- a/iRemote/iRemote-Bridging-Header.h
++++ b/iRemote/iRemote-Bridging-Header.h
+@@ -1,3 +1,4 @@
+ // Bridging header — exposes Obj-C private-API wrappers to Swift.
+ #import "VoiceCapture/PrivateBluetoothManager.h"
+ #import "VoiceCapture/PacketLoggerXPCProbe.h"
++#import "VoiceCapture/RemoteOpusDecoder.h"
+diff --git a/project.yml b/project.yml
+index 682e98b..5c7ae19 100644
+--- a/project.yml
++++ b/project.yml
+@@ -8,6 +8,10 @@ options:
+   groupSortPosition: top
+   generateEmptyDirectories: true
+ 
++packages:
++  FluidAudio:
++    path: ../FluidAudio-upstream
++
+ settings:
+   base:
+     SWIFT_VERSION: "5.10"
+@@ -22,6 +26,9 @@ targets:
+   iRemote:
+     type: application
+     platform: macOS
++    dependencies:
++      - package: FluidAudio
++        product: FluidAudio
+     sources:
+       - path: iRemote
+         excludes:
+@@ -69,3 +76,12 @@ targets:
+         ENABLE_USER_SCRIPT_SANDBOXING: NO
+         SWIFT_OBJC_BRIDGING_HEADER: iRemote/iRemote-Bridging-Header.h
+         CLANG_ENABLE_MODULES: YES
++        HEADER_SEARCH_PATHS:
++          - "$(inherited)"
++          - /opt/homebrew/include
++        LIBRARY_SEARCH_PATHS:
++          - "$(inherited)"
++          - /opt/homebrew/lib
++        OTHER_LDFLAGS:
++          - "$(inherited)"
++          - /opt/homebrew/lib/libopus.a
